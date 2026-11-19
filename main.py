@@ -21,8 +21,15 @@ Model (standard library only, deterministic, offline):
   logit trends overshoot when earners saturate. The target median is the
   damped line read at ln(1 + target hours); the spread combines a random
   walk (0.5 * sqrt(horizon days)) with the fit's residual spread.
+  A trophy with too little signal for a fit (< 2 usable points) persists
+  its last rate with the random-walk spread: in a rich history that rate
+  is already post-dilution, so re-applying the flat-history -1.45 shift
+  would double-count the dilution. (Revision: on synthetic final-like
+  cases this cut mean loss 0.279 -> 0.265 and worst case 0.347 -> 0.319.)
 * Any failure for a case falls back to the house persistence baseline
-  (last rate, random-walk spread), so a case is never invalid.
+  (last rate, random-walk spread), so a case is never invalid. Reads with
+  a missing or malformed timestamp, players_tracked, or rates list are
+  skipped or treated as unknown rather than crashing the case.
 
 Quantiles are inv_logit(median + z_tau * sigma), rounded to 4 decimals
 half-up (as the starter rounds), clamped to [0.01, 99.99] and forced
@@ -96,11 +103,35 @@ def hours_since_epoch(iso):
     return (moment - EPOCH).total_seconds() / 3600.0
 
 
+def read_hours(read):
+    """Hours since epoch for one history read, or None if unparseable."""
+    try:
+        return hours_since_epoch(read["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def rate_at(read, i):
+    """Rate of trophy i in one history read, or None if absent/malformed."""
+    try:
+        rates = read["rates"]
+        if not isinstance(rates, (list, tuple)) or i >= len(rates):
+            return None
+        rate = rates[i]
+        return rate if isinstance(rate, (int, float)) else None
+    except (KeyError, TypeError):
+        return None
+
+
 def distinct_reads(history):
     """Collapse consecutive reads that repeat the same refresh."""
     kept = []
     for read in history:
-        key = (read["players_tracked"], tuple(read["rates"]))
+        if not isinstance(read, dict):
+            continue
+        rates = read.get("rates")
+        key = (read.get("players_tracked"),
+               tuple(rates) if isinstance(rates, (list, tuple)) else None)
         if kept and kept[-1][0] == key:
             continue
         kept.append((key, read))
@@ -125,14 +156,13 @@ def fit_line(xs, ys):
 
 def persistence_rows(case):
     """House baseline: last rate, random-walk spread. Never raises."""
-    last = case["history"][-1] if case.get("history") else None
-    days = max(case.get("horizon_minutes", 0), 0) / 1440.0
+    history = case.get("history") or []
+    last = history[-1] if history and isinstance(history[-1], dict) else None
+    days = max(case.get("horizon_minutes", 0) or 0, 0) / 1440.0
     spread = WALK_SIGMA * math.sqrt(days)
     rows = []
     for i, trophy in enumerate(case["trophies"]):
-        rate = None
-        if last is not None and i < len(last["rates"]):
-            rate = last["rates"][i]
+        rate = rate_at(last, i) if last is not None else None
         rows.append({"id": trophy["id"], "q": quantiles(logit(rate or 0), spread)})
     return {"trophies": rows}
 
@@ -144,17 +174,19 @@ def forecast_case(case, name):
         raise ValueError(f"{name} has no history")
 
     reads = distinct_reads(case["history"])
+    if not reads:
+        raise ValueError(f"{name} has no usable history reads")
     last = reads[-1]
     target_h = hours_since_epoch(case["target"])
     xt = math.log1p(target_h)
-    horizon_days = max(case["horizon_minutes"], 0) / 1440.0
+    horizon_days = max(case.get("horizon_minutes", 0) or 0, 0) / 1440.0
     cutoff_h = hours_since_epoch(case["at"])
 
     # Flat history: every read is the same unrefreshed page.
     if len(reads) < 2:
         rows = []
         for i, trophy in enumerate(case["trophies"]):
-            rate = last["rates"][i]
+            rate = rate_at(last, i)
             if rate is not None and rate >= 100:
                 rows.append({"id": trophy["id"], "q": list(UNIVERSAL_ROW)})
             else:
@@ -169,24 +201,30 @@ def forecast_case(case, name):
     for i in range(len(case["trophies"])):
         pts = []
         for read in reads:
-            rate = read["rates"][i]
+            rate = rate_at(read, i)
             if rate is None or rate <= 0 or rate >= 100:
                 continue
-            pts.append((hours_since_epoch(read["at"]), logit(rate)))
+            h = read_hours(read)
+            if h is None:
+                continue
+            pts.append((h, logit(rate)))
         points_by_trophy.append(pts)
 
     rows = []
     for i, trophy in enumerate(case["trophies"]):
-        rate = last["rates"][i]
+        rate = rate_at(last, i)
         if rate is not None and rate >= 100:
             rows.append({"id": trophy["id"], "q": list(UNIVERSAL_ROW)})
             continue
         pts = points_by_trophy[i]
         if len(pts) < 2:
-            # Too little signal for this trophy: dilute like flat history.
+            # Too little signal for this trophy: persist the last rate.
+            # In a rich history the last rate is already post-dilution,
+            # so the flat-history -1.45 shift would double-count it.
             rows.append({
                 "id": trophy["id"],
-                "q": quantiles(logit(rate or 0) + DILUTION_SHIFT, DILUTION_SPREAD),
+                "q": quantiles(logit(rate or 0),
+                               WALK_SIGMA * math.sqrt(horizon_days)),
             })
             continue
         # Window ladder: 24h, then 48h, then everything, until >= 3 points.
